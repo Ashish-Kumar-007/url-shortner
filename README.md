@@ -194,6 +194,15 @@ controlled development environments that intentionally redirect to private
 destinations. `TRUST_PROXY_HEADERS` defaults to false to prevent clients from
 spoofing their limiter identity.
 
+For Supabase, `DATABASE_URL` must be the PostgreSQL connection string from the
+project's **Connect** dialog (typically starts with `postgresql://`), not the
+Supabase **Project URL** (starts with `https://`) or an API key. In Render, set
+the connection string as the `DATABASE_URL` secret environment variable and
+prefer Supabase's session pooler when a direct connection is unavailable from
+the hosting environment. If the password contains reserved URL characters,
+URL-encode them before placing it in the connection string. Never post or
+commit the connection string.
+
 ### API examples
 
 Create a link:

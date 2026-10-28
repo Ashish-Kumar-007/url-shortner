@@ -1,3 +1,5 @@
+from urllib.parse import urlsplit
+
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -6,6 +8,14 @@ from app.config import Settings
 
 
 def _normalize_database_url(database_url: str) -> str:
+    scheme = urlsplit(database_url).scheme.lower()
+    if scheme not in {"sqlite", "postgres", "postgresql", "postgresql+psycopg"}:
+        raise ValueError(
+            "DATABASE_URL must be a PostgreSQL connection string beginning with "
+            "'postgresql://' (or 'postgres://'), not a Supabase HTTPS project/API "
+            "URL. In Supabase, open Connect and copy the PostgreSQL connection "
+            "string; do not use the Project URL."
+        )
     if database_url.startswith("postgres://"):
         return "postgresql+psycopg://" + database_url.removeprefix("postgres://")
     if database_url.startswith("postgresql://"):

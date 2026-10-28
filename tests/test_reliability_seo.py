@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
@@ -243,3 +244,11 @@ def test_postgres_connection_urls_use_psycopg3():
 
         assert engine.url.drivername == "postgresql+psycopg"
         engine.dispose()
+
+
+def test_https_project_url_is_rejected_as_database_url():
+    settings = Settings(database_url="https://example.supabase.co")
+
+    with pytest.raises(ValueError, match="PostgreSQL connection string") as exc:
+        create_database(settings)
+    assert "do not use the Project URL" in str(exc.value)
