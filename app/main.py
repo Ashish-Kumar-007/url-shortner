@@ -21,6 +21,7 @@ from app.observability import (
     REQUESTS,
     configure_logging,
 )
+from app.safety import validate_redirect_destination
 from app.schemas import ShortenRequest, ShortenResponse, UrlStatsResponse
 from app.seo import render_landing_page
 from app.services.urls import ShortCodeGenerationError, UrlService
@@ -48,6 +49,25 @@ def _canonical_base(base_url: str) -> str:
     return base_url.rstrip("/")
 
 
+def _client_address(request: Request, trust_proxy_headers: bool) -> str:
+    if trust_proxy_headers:
+        forwarded_for = request.headers.get("x-forwarded-for")
+        if forwarded_for:
+            address = forwarded_for.split(",", 1)[0].strip()
+            if address:
+                return address
+    return request.client.host if request.client else "unknown"
+
+
+def _add_security_headers(response: Response, canonical_base: str) -> None:
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "camera=(), geolocation=(), microphone=()"
+    if canonical_base.startswith("https://"):
+        response.headers["Strict-Transport-Security"] = "max-age=31536000"
+
+
 def create_app(
     app_settings: Settings | None = None,
     database_url: str | None = None,
@@ -68,6 +88,8 @@ def create_app(
     application.state.session_factory = app_session_factory
     application.state.settings = configured
     application.state.engine = app_engine
+    application.state.create_rate_buckets = {}
+    application.state.rate_limit_requests = 0
 
     def session_dependency(request: Request):
         with request.app.state.session_factory() as session:
@@ -128,9 +150,48 @@ def create_app(
         started = time.perf_counter()
         status_code = 500
         try:
+            if request.method == "POST" and request.url.path == "/api/shorten":
+                now = time.monotonic()
+                address = _client_address(request, configured.trust_proxy_headers)
+                buckets: dict[str, tuple[float, int]] = (
+                    request.app.state.create_rate_buckets
+                )
+                window = configured.create_rate_limit_window_seconds
+                bucket = buckets.get(address)
+                if bucket is None or now - bucket[0] >= window:
+                    bucket = (now, 0)
+                if bucket[1] >= configured.create_rate_limit_count:
+                    status_code = 429
+                    response = _error(
+                        429,
+                        "rate_limit_exceeded",
+                        "Too many link creation requests",
+                    )
+                    response.headers["Retry-After"] = str(
+                        max(1, int(window - (now - bucket[0])))
+                    )
+                    response.headers["X-Request-ID"] = request_id
+                    _add_security_headers(response, canonical_base)
+                    return response
+                buckets[address] = (bucket[0], bucket[1] + 1)
+
+                request.app.state.rate_limit_requests += 1
+                if request.app.state.rate_limit_requests % 256 == 0:
+                    expired = [
+                        key
+                        for key, value in buckets.items()
+                        if now - value[0] >= window
+                    ]
+                    for key in expired:
+                        del buckets[key]
+                    while len(buckets) > 10_000:
+                        oldest = min(buckets, key=lambda key: buckets[key][0])
+                        del buckets[oldest]
+
             response = await call_next(request)
             status_code = response.status_code
             response.headers["X-Request-ID"] = request_id
+            _add_security_headers(response, canonical_base)
             return response
         finally:
             duration = time.perf_counter() - started
@@ -200,6 +261,11 @@ def create_app(
     @application.post("/api/shorten", response_model=ShortenResponse, status_code=201)
     def shorten(payload: ShortenRequest, request: Request, session: DbSession):
         configured_settings: Settings = request.app.state.settings
+        if configured_settings.block_private_destinations:
+            try:
+                validate_redirect_destination(str(payload.target_url))
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
         service = UrlService(
             session,
             max_attempts=configured_settings.code_generation_attempts,
@@ -218,8 +284,22 @@ def create_app(
         )
 
     @application.get("/{short_code}")
-    def redirect(short_code: str, session: DbSession):
-        url = UrlService(session).get_active_and_record_click(short_code)
+    def redirect(short_code: str, request: Request, session: DbSession):
+        configured_settings: Settings = request.app.state.settings
+        validator = (
+            validate_redirect_destination
+            if configured_settings.block_private_destinations
+            else None
+        )
+        try:
+            url = UrlService(session).get_active_and_record_click(
+                short_code,
+                validate_destination=validator,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=410, detail="Short link is no longer available"
+            ) from exc
         if url is None:
             raise HTTPException(status_code=404, detail="Short link not found")
         return RedirectResponse(url=url.target_url, status_code=302)

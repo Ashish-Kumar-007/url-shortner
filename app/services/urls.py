@@ -1,5 +1,6 @@
 import secrets
 import string
+from collections.abc import Callable
 from datetime import datetime
 
 from sqlalchemy.exc import IntegrityError
@@ -39,8 +40,15 @@ class UrlService:
             "Could not generate an available short code after bounded retries"
         )
 
-    def get_active_and_record_click(self, short_code: str) -> Url | None:
-        return self.repository.find_active_and_record_click(short_code)
+    def get_active_and_record_click(
+        self,
+        short_code: str,
+        validate_destination: Callable[[str], None] | None = None,
+    ) -> Url | None:
+        return self.repository.find_active_and_record_click(
+            short_code,
+            validate_destination=validate_destination,
+        )
 
     def process_click_events(self, batch_size: int = 500) -> int:
         return self.repository.process_click_events(batch_size)

@@ -2,11 +2,13 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 
 from app.config import Settings
 from app.database import create_database
 from app.main import create_app
+from app.models import ClickEvent, Url
 from app.services.urls import UrlService
 
 
@@ -39,6 +41,121 @@ def test_validation_errors_use_the_api_error_envelope(client):
     assert response.headers["x-request-id"]
     assert response.json()["error"]["code"] == "validation_error"
     assert response.json()["error"]["details"]
+
+
+def test_private_and_credentialed_redirect_destinations_are_rejected(client):
+    for destination in (
+        "http://127.0.0.1/admin",
+        "http://192.168.1.10/",
+        "http://localhost/",
+        "http://user:password@example.com/",
+        "http://2130706433/",
+    ):
+        response = client.post("/api/shorten", json={"target_url": destination})
+
+        assert response.status_code == 422, destination
+        assert response.json()["error"]["code"] == "validation_error"
+
+
+def test_legacy_private_destination_is_not_redirected_or_counted(tmp_path):
+    application = create_app(
+        database_url=f"sqlite:///{(tmp_path / 'legacy-private.db').as_posix()}"
+    )
+    with TestClient(application) as client:
+        with application.state.session_factory() as session:
+            session.add(Url(short_code="legacy1", target_url="http://127.0.0.1/"))
+            session.commit()
+
+        response = client.get("/legacy1", follow_redirects=False)
+        with application.state.session_factory() as session:
+            events = list(session.scalars(select(ClickEvent)))
+
+    assert response.status_code == 410
+    assert not events
+
+
+def test_link_creation_is_rate_limited_per_client_and_returns_retry_after(tmp_path):
+    settings = Settings(create_rate_limit_count=1)
+    application = create_app(
+        app_settings=settings,
+        database_url=f"sqlite:///{(tmp_path / 'rate-limit.db').as_posix()}",
+    )
+    with TestClient(application) as client:
+        payload = {"target_url": "https://example.com"}
+        assert client.post("/api/shorten", json=payload).status_code == 201
+        limited = client.post("/api/shorten", json=payload)
+
+    assert limited.status_code == 429
+    assert limited.headers["retry-after"]
+    assert limited.headers["x-request-id"]
+    assert limited.headers["x-content-type-options"] == "nosniff"
+    assert limited.json()["error"]["code"] == "rate_limit_exceeded"
+
+
+def test_trusted_proxy_client_addresses_are_used_for_rate_limits(tmp_path):
+    settings = Settings(create_rate_limit_count=1, trust_proxy_headers=True)
+    application = create_app(
+        app_settings=settings,
+        database_url=f"sqlite:///{(tmp_path / 'proxy-rate-limit.db').as_posix()}",
+    )
+    with TestClient(application) as client:
+        payload = {"target_url": "https://example.com"}
+        first = client.post(
+            "/api/shorten",
+            json=payload,
+            headers={"X-Forwarded-For": "198.51.100.10"},
+        )
+        different_client = client.post(
+            "/api/shorten",
+            json=payload,
+            headers={"X-Forwarded-For": "198.51.100.11"},
+        )
+        repeated_client = client.post(
+            "/api/shorten",
+            json=payload,
+            headers={"X-Forwarded-For": "198.51.100.10"},
+        )
+
+    assert first.status_code == 201
+    assert different_client.status_code == 201
+    assert repeated_client.status_code == 429
+
+
+def test_forwarded_ip_is_ignored_when_proxy_trust_is_disabled(tmp_path):
+    settings = Settings(create_rate_limit_count=1, trust_proxy_headers=False)
+    application = create_app(
+        app_settings=settings,
+        database_url=f"sqlite:///{(tmp_path / 'untrusted-proxy.db').as_posix()}",
+    )
+    with TestClient(application) as client:
+        payload = {"target_url": "https://example.com"}
+        first = client.post(
+            "/api/shorten",
+            json=payload,
+            headers={"X-Forwarded-For": "198.51.100.10"},
+        )
+        spoofed = client.post(
+            "/api/shorten",
+            json=payload,
+            headers={"X-Forwarded-For": "198.51.100.11"},
+        )
+
+    assert first.status_code == 201
+    assert spoofed.status_code == 429
+
+
+def test_security_headers_and_hsts_are_configured_for_https(tmp_path):
+    settings = Settings(base_url="https://short.example")
+    application = create_app(
+        app_settings=settings,
+        database_url=f"sqlite:///{(tmp_path / 'headers.db').as_posix()}",
+    )
+    with TestClient(application) as client:
+        response = client.get("/health/live")
+
+    assert response.headers["x-frame-options"] == "DENY"
+    assert response.headers["referrer-policy"] == "no-referrer"
+    assert response.headers["strict-transport-security"].startswith("max-age=")
 
 
 def test_database_failure_returns_503_and_health_stays_live(tmp_path):

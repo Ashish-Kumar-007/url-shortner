@@ -124,13 +124,30 @@ Add multiple app instances behind a load balancer (4A) and database scaling
 (4D) only when target capacity and follow-up measurements justify them. Re-run
 the same benchmarks after each change.
 
-## Phase 5 — Production readiness (in progress)
+## Phase 5 — Production readiness (implementation in progress)
 
-The project has a non-root Docker image, Docker Compose health checks, a
-PostgreSQL-backed CI workflow, JSON logs, Prometheus metrics, and live/readiness
-probes. Before a production launch, still configure hosting and managed secrets,
-HTTPS/TLS, rate limits and abuse monitoring, safe-redirect policies, database
-backup/restore tests, alerts, rollback procedures, and capacity objectives.
+Implemented locally: the API applies a per-process creation rate limit (default
+60 requests per client per 60 seconds), emits security headers and HSTS when
+configured with an HTTPS origin, and rejects credentialed redirect URLs,
+localhost/private hostnames, and non-public literal IP addresses by default.
+Configuration is documented in `.env.example`. The GitHub Actions workflow now
+has read-only repository permissions. Sample Prometheus alert rules and an
+operations runbook are in `ops/`.
+
+The in-process limiter is a supplementary control, not a distributed limiter:
+configure rate limits at the hosting edge as the authoritative abuse control.
+Set `TRUST_PROXY_HEADERS=true` only when the trusted edge overwrites
+`X-Forwarded-For` and blocks direct application access. The destination policy
+does not perform DNS resolution and cannot detect a public-looking hostname
+that resolves to a private address.
+
+**Phase 5 is not complete.** This repository has not been deployed to a public
+host; production secrets/TLS, an alert receiver, backup retention, and a
+successful restore drill have not been configured or verified. Before launch,
+follow [`ops/runbook.md`](ops/runbook.md), set service ownership and recovery
+objectives, configure provider-level controls, and run and record a restore
+drill. Do not mark the phase complete until the hosted smoke checks and restore
+drill pass.
 
 ## Requirements and local setup
 
@@ -170,7 +187,12 @@ Copy `.env.example` to `.env` for local host-based app runs. Set `DATABASE_URL`
 to a reachable PostgreSQL database and `BASE_URL` to the public short-link
 origin. The `DB_CONNECT_TIMEOUT_SECONDS`, `DB_STATEMENT_TIMEOUT_MS`,
 `DB_POOL_TIMEOUT_SECONDS`, `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, and
-`CODE_GENERATION_ATTEMPTS` settings have safe bounds.
+`CODE_GENERATION_ATTEMPTS` settings have safe bounds. Link creation is limited
+by `CREATE_RATE_LIMIT_COUNT` within `CREATE_RATE_LIMIT_WINDOW_SECONDS`.
+`BLOCK_PRIVATE_DESTINATIONS` defaults to true; set it to false only for
+controlled development environments that intentionally redirect to private
+destinations. `TRUST_PROXY_HEADERS` defaults to false to prevent clients from
+spoofing their limiter identity.
 
 ### API examples
 

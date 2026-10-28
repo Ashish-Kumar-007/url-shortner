@@ -1,0 +1,37 @@
+groups:
+  - name: url-shortener
+    rules:
+      - alert: URLShortenerUnavailable
+        expr: up{job="url-shortener"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: URL Shortener metrics endpoint is unavailable
+          description: The URL Shortener scrape target has been down for over two minutes.
+
+      - alert: URLShortenerElevatedServerErrors
+        expr: |
+          sum(rate(url_shortener_http_requests_total{job="url-shortener",status=~"5.."}[5m]))
+          /
+          clamp_min(sum(rate(url_shortener_http_requests_total{job="url-shortener"}[5m])), 0.001)
+          > 0.02
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: URL Shortener server error rate is elevated
+          description: More than 2% of requests have returned 5xx responses for ten minutes.
+
+      - alert: URLShortenerHighP95Latency
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(url_shortener_http_request_duration_seconds_bucket{job="url-shortener"}[5m]))
+          ) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: URL Shortener p95 latency is above 500ms
+          description: p95 request latency has exceeded 500ms for ten minutes.

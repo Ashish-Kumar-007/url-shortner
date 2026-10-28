@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from datetime import datetime, timezone
 
 from sqlalchemy import delete, select, update
@@ -27,7 +28,11 @@ class UrlRepository:
     def find(self, short_code: str) -> Url | None:
         return self.session.get(Url, short_code)
 
-    def find_active_and_record_click(self, short_code: str) -> Url | None:
+    def find_active_and_record_click(
+        self,
+        short_code: str,
+        validate_destination: Callable[[str], None] | None = None,
+    ) -> Url | None:
         now = datetime.now(timezone.utc)
         statement = select(Url.short_code, Url.target_url, Url.expires_at).where(
             Url.short_code == short_code,
@@ -37,6 +42,8 @@ class UrlRepository:
             result = self.session.execute(statement).one_or_none()
             if result is None:
                 return None
+            if validate_destination is not None:
+                validate_destination(result.target_url)
             self.session.add(ClickEvent(short_code=short_code, clicked_at=now))
             self.session.flush()
         return Url(
