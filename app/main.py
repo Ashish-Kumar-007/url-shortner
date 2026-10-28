@@ -1,8 +1,14 @@
+import html
+import secrets
+import time
 from contextlib import asynccontextmanager
 from typing import Annotated
+from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import RedirectResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from prometheus_client import make_asgi_app
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -10,8 +16,36 @@ from sqlalchemy.orm import Session
 from app.config import Settings
 from app.database import create_database
 from app.models import Base
+from app.observability import (
+    REQUEST_DURATION,
+    REQUESTS,
+    configure_logging,
+)
 from app.schemas import ShortenRequest, ShortenResponse, UrlStatsResponse
+from app.seo import render_landing_page
 from app.services.urls import ShortCodeGenerationError, UrlService
+
+logger = configure_logging()
+
+
+def _error(status_code: int, code: str, message: str, details=None) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {
+                "code": code,
+                "message": message,
+                **({"details": details} if details is not None else {}),
+            }
+        },
+    )
+
+
+def _canonical_base(base_url: str) -> str:
+    parsed = urlsplit(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("BASE_URL must be an absolute HTTP or HTTPS URL")
+    return base_url.rstrip("/")
 
 
 def create_app(
@@ -21,6 +55,7 @@ def create_app(
     configured = app_settings or Settings()
     if database_url is not None:
         configured = configured.model_copy(update={"database_url": database_url})
+    canonical_base = _canonical_base(configured.base_url)
     app_engine, app_session_factory = create_database(configured)
 
     @asynccontextmanager
@@ -29,9 +64,10 @@ def create_app(
         yield
         app_engine.dispose()
 
-    application = FastAPI(title="URL Shortener", version="0.1.0", lifespan=lifespan)
+    application = FastAPI(title="URL Shortener", version="0.2.0", lifespan=lifespan)
     application.state.session_factory = app_session_factory
     application.state.settings = configured
+    application.state.engine = app_engine
 
     def session_dependency(request: Request):
         with request.app.state.session_factory() as session:
@@ -39,17 +75,129 @@ def create_app(
 
     DbSession = Annotated[Session, Depends(session_dependency)]
 
+    @application.exception_handler(HTTPException)
+    async def http_error_handler(_: Request, exc: HTTPException):
+        code = {
+            404: "not_found",
+            422: "validation_error",
+            503: "service_unavailable",
+        }.get(exc.status_code, "request_error")
+        message = exc.detail if isinstance(exc.detail, str) else "Request failed"
+        return _error(exc.status_code, code, message)
+
+    @application.exception_handler(RequestValidationError)
+    async def validation_error_handler(_: Request, exc: RequestValidationError):
+        details = [
+            {
+                "location": list(error["loc"]),
+                "message": error["msg"],
+                "type": error["type"],
+            }
+            for error in exc.errors()
+        ]
+        return _error(422, "validation_error", "Request validation failed", details)
+
+    @application.exception_handler(SQLAlchemyError)
+    async def database_error_handler(request: Request, exc: SQLAlchemyError):
+        logger.exception(
+            "Database operation failed",
+            extra={
+                "request_id": getattr(request.state, "request_id", None),
+                "path": request.url.path,
+                "method": request.method,
+            },
+        )
+        return _error(503, "database_unavailable", "Database unavailable")
+
+    @application.exception_handler(Exception)
+    async def unexpected_error_handler(request: Request, exc: Exception):
+        logger.exception(
+            "Unexpected request failure",
+            extra={
+                "request_id": getattr(request.state, "request_id", None),
+                "path": request.url.path,
+                "method": request.method,
+            },
+        )
+        return _error(500, "internal_error", "An unexpected error occurred")
+
+    @application.middleware("http")
+    async def observe_requests(request: Request, call_next):
+        request_id = secrets.token_hex(8)
+        request.state.request_id = request_id
+        started = time.perf_counter()
+        status_code = 500
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            response.headers["X-Request-ID"] = request_id
+            return response
+        finally:
+            duration = time.perf_counter() - started
+            route = getattr(request.scope.get("route"), "path", "unmatched")
+            if request.url.path != "/metrics":
+                REQUESTS.labels(request.method, route, str(status_code)).inc()
+                REQUEST_DURATION.labels(request.method, route).observe(duration)
+            logger.info(
+                "HTTP request",
+                extra={
+                    "request_id": request_id,
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status_code": status_code,
+                    "duration_ms": round(duration * 1000, 3),
+                },
+            )
+
+    @application.get("/", response_class=HTMLResponse, include_in_schema=False)
+    def landing_page():
+        return render_landing_page(canonical_base, configured.seo_indexable)
+
+    @application.get("/robots.txt", include_in_schema=False)
+    def robots_txt():
+        if not configured.seo_indexable:
+            return Response("User-agent: *\nDisallow: /\n", media_type="text/plain")
+        return Response(
+            f"User-agent: *\nAllow: /\nSitemap: {canonical_base}/sitemap.xml\n",
+            media_type="text/plain",
+        )
+
+    @application.get("/sitemap.xml", include_in_schema=False)
+    def sitemap():
+        if not configured.seo_indexable:
+            raise HTTPException(status_code=404, detail="Sitemap is disabled")
+        location = html.escape(canonical_base, quote=True)
+        return Response(
+            f'<?xml version="1.0" encoding="UTF-8"?>'
+            f'<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+            f"<url><loc>{location}/</loc></url></urlset>",
+            media_type="application/xml",
+        )
+
+    application.mount("/metrics", make_asgi_app())
+
     @application.get("/health")
-    def health(session: DbSession):
+    @application.get("/health/ready", include_in_schema=False)
+    def readiness(request: Request, session: DbSession):
         try:
             session.execute(text("SELECT 1"))
-        except SQLAlchemyError as exc:
-            raise HTTPException(status_code=503, detail="Database unavailable") from exc
+        except SQLAlchemyError:
+            logger.exception(
+                "Readiness database check failed",
+                extra={
+                    "request_id": getattr(request.state, "request_id", None),
+                    "path": "/health/ready",
+                    "method": "GET",
+                },
+            )
+            return _error(503, "database_unavailable", "Database unavailable")
+        return {"status": "ok", "database": "ok"}
+
+    @application.get("/health/live", include_in_schema=False)
+    def liveness():
         return {"status": "ok"}
 
-    @application.post(
-        "/api/shorten", response_model=ShortenResponse, status_code=201
-    )
+    @application.post("/api/shorten", response_model=ShortenResponse, status_code=201)
     def shorten(payload: ShortenRequest, request: Request, session: DbSession):
         configured_settings: Settings = request.app.state.settings
         service = UrlService(
@@ -71,14 +219,12 @@ def create_app(
 
     @application.get("/{short_code}")
     def redirect(short_code: str, session: DbSession):
-        url = UrlService(session).get_active_and_increment(short_code)
+        url = UrlService(session).get_active_and_record_click(short_code)
         if url is None:
             raise HTTPException(status_code=404, detail="Short link not found")
         return RedirectResponse(url=url.target_url, status_code=302)
 
-    @application.get(
-        "/api/urls/{short_code}/stats", response_model=UrlStatsResponse
-    )
+    @application.get("/api/urls/{short_code}/stats", response_model=UrlStatsResponse)
     def stats(short_code: str, session: DbSession):
         url = UrlService(session).get(short_code)
         if url is None:

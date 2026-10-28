@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>URL Shortener with Click Tracking and Expiring Links</title>
+  <meta name="description" content="Create secure, shareable short links with optional expiration and click tracking. A fast, open-source URL shortener with a simple REST API.">
+  <meta name="keywords" content="URL shortener, short link generator, link click tracking, expiring links, open-source URL shortener, URL shortener API">
+  <meta name="robots" content="__ROBOTS__">
+  <link rel="canonical" href="__CANONICAL_URL__">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="URL Shortener with Click Tracking">
+  <meta property="og:description" content="Create secure short links, set an expiration, and track clicks with a simple API.">
+  <meta property="og:url" content="__CANONICAL_URL__">
+  <meta name="twitter:card" content="summary">
+  <script type="application/ld+json">__STRUCTURED_DATA__</script>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; color: #172033; background: #f5f7fb; }
+    body { margin: 0; }
+    main { max-width: 720px; margin: 4rem auto; padding: 2rem; }
+    .card { background: white; border: 1px solid #e1e6ef; border-radius: 16px; padding: 2rem; box-shadow: 0 8px 32px #1720330b; }
+    h1 { line-height: 1.15; font-size: clamp(2rem, 6vw, 3.2rem); }
+    p { line-height: 1.6; color: #536078; }
+    label { display: block; font-weight: 600; margin: 1rem 0 .4rem; }
+    input, button { box-sizing: border-box; width: 100%; padding: .8rem; border: 1px solid #cbd3df; border-radius: 8px; font: inherit; }
+    button { margin-top: 1.2rem; background: #2355d6; color: white; border: 0; font-weight: 700; cursor: pointer; }
+    a { color: #2355d6; }
+    #result { overflow-wrap: anywhere; }
+    footer { margin-top: 2rem; font-size: .9rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <article class="card">
+      <h1>A simple URL shortener for links you can track</h1>
+      <p>Create a compact short link from any HTTP or HTTPS URL. Add an optional expiration time, share the link, and check its click count. This open-source link shortener also provides a straightforward REST API.</p>
+      <form id="shorten-form">
+        <label for="target-url">Long URL</label>
+        <input id="target-url" name="target_url" type="url" placeholder="https://example.com/article" required maxlength="2048">
+        <label for="expires-at">Expiration (optional)</label>
+        <input id="expires-at" name="expires_at" type="datetime-local">
+        <button type="submit">Create short link</button>
+      </form>
+      <p id="result" aria-live="polite"></p>
+    </article>
+    <section>
+      <h2>Short links with expiration and click statistics</h2>
+      <p>Use short URLs in messages, documents, and campaigns. Each generated link has a unique code, redirects to its original destination, and reports total clicks. Set an expiration when a link should stop working.</p>
+      <h2>URL shortener API</h2>
+      <p>Automate link creation with <code>POST /api/shorten</code>, send visitors through <code>GET /{short_code}</code>, and read click statistics from <code>GET /api/urls/{short_code}/stats</code>. Explore the interactive API docs at <a href="/docs">/docs</a>.</p>
+    </section>
+    <footer><a href="/docs">API documentation</a> · <a href="/health">Service health</a></footer>
+  </main>
+  <script>
+    const form = document.querySelector("#shorten-form");
+    const result = document.querySelector("#result");
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      result.textContent = "Creating link…";
+      const payload = { target_url: form.target_url.value };
+      if (form.expires_at.value) {
+        payload.expires_at = new Date(form.expires_at.value).toISOString();
+      }
+      try {
+        const response = await fetch("/api/shorten", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error?.message || "Could not create link.");
+        result.replaceChildren();
+        const link = document.createElement("a");
+        link.href = data.short_url;
+        link.textContent = data.short_url;
+        result.append("Short link: ", link, " · ");
+        const stats = document.createElement("a");
+        stats.href = `/api/urls/${data.short_code}/stats`;
+        stats.textContent = "View click statistics";
+        result.append(stats);
+      } catch (error) {
+        result.textContent = error.message;
+      }
+    });
+  </script>
+</body>
+</html>

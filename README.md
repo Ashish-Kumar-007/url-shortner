@@ -1,58 +1,176 @@
 # URL Shortener
 
-A modular-monolith URL shortener using FastAPI, SQLAlchemy, and PostgreSQL.
-The application stores URL mappings durably, generates seven-character short
-codes, redirects with HTTP 302, enforces optional expiration, and reports click
-counts.
+An open-source URL shortener built with FastAPI, PostgreSQL, and SQLAlchemy.
+Create secure seven-character short links, optionally expire them, redirect
+with HTTP 302, and inspect click statistics through an API or a lightweight web
+page.
 
 ## Phase 1 — MVP (complete)
 
-### Included
+- `POST /api/shorten` creates a unique short link, even when the destination URL
+  has already been shortened.
+- `GET /{short_code}` redirects to the original HTTP(S) URL and atomically
+  records a click. Unknown and expired codes return 404.
+- `GET /api/urls/{short_code}/stats` returns public click statistics and link
+  timestamps.
+- `GET /health` checks database readiness; `/health/live` is a liveness probe.
+- PostgreSQL stores links and click events durably. SQLite is also supported
+  for lightweight local tests.
+- URL length and scheme and timezone-aware future expirations are validated.
 
-- `POST /api/shorten` creates a short link. The same destination can be shortened
-  more than once and receives a distinct code.
-- `GET /{short_code}` redirects to the destination with HTTP 302 and atomically
-  increments the click count. Unknown and expired codes return 404.
-- `GET /api/urls/{short_code}/stats` returns the destination, timestamps,
-  expiration, and public click count.
-- `GET /health` checks database connectivity.
-- PostgreSQL is the default database. SQLAlchemy creates the `urls` table at
-  application startup; mappings and counts are stored durably.
-- Codes use Python's cryptographically secure `secrets` module. Unique-key
-  collisions are retried a bounded number of times.
-- Request validation limits destinations to HTTP(S) URLs of at most 2,048
-  characters and requires expiration timestamps to include a timezone and be in
-  the future.
-- Tests use SQLite so the suite can run without a local PostgreSQL server or
-  Docker. Set `DATABASE_URL` to PostgreSQL to run the service against PostgreSQL.
+## Phase 2 — Reliability and correctness (complete)
 
-### Prerequisites
+- Link creation, redirect click events, and batched click aggregation use
+  explicit SQLAlchemy transaction boundaries.
+- Short-code collisions receive bounded retries. Database connect, statement,
+  and pool timeouts are configurable.
+- API errors have a consistent JSON envelope; database failures return 503.
+- JSON request logs include request IDs and duration. Prometheus request counts
+  and latency histograms are exposed at `/metrics/`.
+- `/health/ready` checks PostgreSQL; `/health/live` does not depend on it.
+- The test suite runs against SQLite locally and PostgreSQL in GitHub Actions.
+  Concurrency tests exercise code creation, click-event processing, and
+  consistent final click counts.
 
-- Python 3.11 or newer
-- PostgreSQL 14 or newer for the default application database
-- `uv` (or Python's built-in `venv` and `pip`)
+## Phase 3 — Performance optimization (benchmarking available)
 
-### Setup
+Run the API locally, then measure link creation, redirects (repeated clicks on
+one code), and statistics separately at 25, 50, and 100 requests per second:
+
+```powershell
+uv run python benchmarks/run.py --base-url http://localhost:8000 --rates 25 50 100 --duration 30
+```
+
+The script reports achieved requests/second, errors, client-side skipped
+requests, and p50/p95/p99 latency. Each endpoint/rate combination schedules
+requests for the requested duration, then waits for in-flight work to finish.
+Scrape `/metrics/` for request totals and latency histograms; use `docker stats`
+for container CPU/memory and PostgreSQL's
+`pg_stat_activity` for active connections. Compare runs on the same machine
+and database before drawing conclusions.
+
+### Initial local baseline
+
+Measured 2026-10-28 on the local Windows/Docker Desktop setup, against
+PostgreSQL 16, before asynchronous click aggregation. Each cell ran for 10
+seconds; all requests succeeded and the client skipped none. These short runs
+are a directional baseline, not a production capacity claim.
+
+| Endpoint | Target RPS | Achieved RPS | p50 ms | p95 ms | p99 ms |
+|---|---:|---:|---:|---:|---:|
+| Create | 25 | 24.94 | 54.51 | 57.74 | 59.27 |
+| Redirect | 25 | 24.99 | 12.49 | 19.26 | 198.66 |
+| Stats | 25 | 25.00 | 9.79 | 12.74 | 14.86 |
+| Create | 50 | 49.81 | 54.08 | 59.15 | 60.98 |
+| Redirect | 50 | 49.99 | 12.74 | 24.17 | 162.02 |
+| Stats | 50 | 49.98 | 9.74 | 14.89 | 17.77 |
+| Create | 100 | 97.40 | 58.91 | 349.80 | 403.58 |
+| Redirect | 100 | 99.93 | 13.09 | 103.57 | 208.12 |
+| Stats | 100 | 99.62 | 9.95 | 19.64 | 39.29 |
+
+During sampling, the app peaked at 118% CPU and PostgreSQL at 23.09%; the
+highest observed database client connection count was 16. The redirect tail
+latency rose sharply at 100 RPS while stats stayed lower, so click-counter
+contention warranted a post-baseline experiment. A mapping cache alone would
+not remove that write.
+
+The short-code lookup plan uses the `urls_pkey` index:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT short_code, target_url, expires_at
+FROM urls
+WHERE short_code = 'aB3dE9x';
+```
+
+In the sampled run, PostgreSQL selected an index scan with one shared-buffer
+hit.
+
+### Post-baseline click aggregation
+
+Redirects now persist a click event and return without updating the shared URL
+counter row. The separate PostgreSQL-backed worker claims event batches with
+`FOR UPDATE SKIP LOCKED`, aggregates counts per code, and commits the counter
+updates and event deletion together. This avoids lost increments across
+workers and retries a batch after a worker crash. Click statistics are
+eventually consistent; the Compose worker polls every 250 ms by default.
+
+Repeat the benchmark above to compare the redirect tail latency before and
+after this change. Redis remains deferred: the test measured a write bottleneck,
+and mapping caching does not address it.
+
+The same 10-second run after adding the worker reduced redirect p95 at 100 RPS
+from 103.57 ms to 62.20 ms and p99 from 208.12 ms to 124.39 ms, with no request
+errors or client skips. At 25/50 RPS, redirect p95 was 14.24/14.18 ms. During
+the post-change run, app CPU peaked at 99.66%, worker CPU at 13.7%, database CPU
+at 28.86%, and the maximum PostgreSQL client connection count was 8.
+
+Five-second exploratory probes at 150, 200, 300, and 500 RPS caused multi-second
+latencies and client-skipped requests; one create request failed at 500 RPS.
+Because the load generator and Docker app shared this Windows machine, this
+locates the local setup's stress limit, not a server-only capacity guarantee.
+Use a separate load-generator host for a production capacity decision.
+
+Redis remains deferred: mapping caches do not eliminate click-counter write
+contention.
+
+## Phase 4 — Scale architecture (4C implemented; remaining milestones gated)
+
+The app is stateless across requests and persists URL mappings in PostgreSQL.
+Milestone 4C is implemented as a durable PostgreSQL click-event queue and
+separate worker, based on the redirect tail-latency measurement above. Milestone
+4B (Redis) remains deferred because the observed bottleneck was a counter write.
+Add multiple app instances behind a load balancer (4A) and database scaling
+(4D) only when target capacity and follow-up measurements justify them. Re-run
+the same benchmarks after each change.
+
+## Phase 5 — Production readiness (in progress)
+
+The project has a non-root Docker image, Docker Compose health checks, a
+PostgreSQL-backed CI workflow, JSON logs, Prometheus metrics, and live/readiness
+probes. Before a production launch, still configure hosting and managed secrets,
+HTTPS/TLS, rate limits and abuse monitoring, safe-redirect policies, database
+backup/restore tests, alerts, rollback procedures, and capacity objectives.
+
+## Requirements and local setup
+
+- Python 3.11+ and `uv`
+- Docker Desktop with the Linux container engine, for the full PostgreSQL-backed
+  application
+
+Start the application and PostgreSQL:
+
+```powershell
+docker compose up --build -d
+docker compose ps
+```
+
+The app is at `http://localhost:8000`; PostgreSQL is exposed on host port `5433`
+to avoid conflicts with a PostgreSQL service already using port `5432`. The
+Compose-only `postgres` / `postgres` credentials are for local development;
+replace them with managed secrets in a hosted deployment. The named database
+volume survives container restarts. `docker compose down -v` deletes it.
+
+Run tests against SQLite or the running PostgreSQL container:
 
 ```powershell
 uv sync
-Copy-Item .env.example .env
-```
-
-Set `DATABASE_URL` in `.env` to a PostgreSQL connection string for a database
-that exists and is reachable. The default is
-`postgresql+psycopg://postgres:postgres@localhost:5432/url_shortener`.
-`BASE_URL` controls the absolute short URL returned by the create endpoint.
-
-Run the app and tests:
-
-```powershell
-uv run uvicorn app.main:app --reload
 uv run pytest
+$env:TEST_DATABASE_URL = 'postgresql+psycopg://postgres:postgres@localhost:5433/url_shortener'
+uv run pytest
+Remove-Item Env:TEST_DATABASE_URL
 ```
 
-The app creates the `urls` table on startup. Visit
-`http://localhost:8000/docs` for the interactive API documentation.
+Use a dedicated empty database for `TEST_DATABASE_URL`; tests create persistent
+sample links in that database.
+
+### Configuration
+
+Copy `.env.example` to `.env` for local host-based app runs. Set `DATABASE_URL`
+to a reachable PostgreSQL database and `BASE_URL` to the public short-link
+origin. The `DB_CONNECT_TIMEOUT_SECONDS`, `DB_STATEMENT_TIMEOUT_MS`,
+`DB_POOL_TIMEOUT_SECONDS`, `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, and
+`CODE_GENERATION_ATTEMPTS` settings have safe bounds.
 
 ### API examples
 
@@ -65,52 +183,26 @@ Invoke-RestMethod -Method Post `
   -Body '{"target_url":"https://example.com/docs","expires_at":"2030-01-01T00:00:00Z"}'
 ```
 
-Example response:
+Open the returned `short_url` for a 302 redirect. Read
+`GET /api/urls/{short_code}/stats` to see the eventually consistent click
+count. Interactive API docs are available at `/docs`.
 
-```json
-{
-  "short_code": "aB3dE9x",
-  "short_url": "http://localhost:8000/aB3dE9x",
-  "target_url": "https://example.com/docs",
-  "expires_at": "2030-01-01T00:00:00Z"
-}
-```
+### SEO and Google indexing
 
-Open the returned `short_url` to follow its HTTP 302 redirect. Retrieve
-statistics with `GET /api/urls/{short_code}/stats`; a successful redirect
-increments `click_count`.
+The root page includes descriptive title and content for a URL shortener, short
+link generator, click tracking, expiring links, and the URL shortener API,
+along with canonical and Open Graph metadata, structured data, `robots.txt`,
+and a sitemap. It is `noindex` by default so local/dev URLs are not presented
+for indexing. For a deployed public site, set `BASE_URL` to its real HTTPS
+origin and `SEO_INDEXABLE=true`; the sitemap is then available at
+`/sitemap.xml`. Add the deployed site to Google Search Console and submit the
+sitemap. These changes make the site crawlable and describe its content; they
+cannot guarantee Google ranking. Google does not use the `meta keywords` tag
+for ranking.
 
-### Verification
-
-Automated tests cover link creation, distinct codes for repeated URLs,
-redirects, click counts, expiration and unknown codes, URL validation,
-persistence across app restarts, and concurrent creation.
-
-## Phase 2 — Reliability and correctness (planned)
-
-Define explicit transaction boundaries and database timeouts; exercise
-concurrent creation and click updates against PostgreSQL; standardize dependency
-failure responses; and add structured logs and basic request metrics.
-
-## Phase 3 — Performance optimization (planned)
-
-Establish endpoint-specific benchmarks for throughput, latency, errors,
-resource use, and database connections. Inspect query plans, tune pooling, and
-measure click-counter contention before deciding whether Redis or a different
-analytics design is justified. Test at 25, 50, and 100 requests per second and
-then find the system's breaking point.
-
-## Phase 4 — Scale the architecture (planned)
-
-Scale out stateless app instances behind a load balancer; introduce Redis only
-with correct cache expiration; separate click analytics into an asynchronous
-queue and worker if write contention warrants it; evaluate database scaling
-based on measurements; and document health checks, graceful shutdown, and
-recovery behavior.
-
-## Phase 5 — Production readiness (planned)
-
-Add rate limiting and abuse monitoring, safe redirect policies, managed
-secrets and TLS, operational metrics and alerts, database backup and restore
-tests, CI/CD and staged deployment, capacity and cost estimates, and incident
-and rollback runbooks. Document deployment and recovery objectives.
+Render is a simple deployment option: deploy this repository as a Docker web
+service and create a managed PostgreSQL database in the same region. Configure
+the database connection string, `BASE_URL`, and `SEO_INDEXABLE` as service
+environment variables, then use the generated public URL (or attach a custom
+domain) as the canonical origin. Never use the local Compose credentials in
+production.

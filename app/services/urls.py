@@ -23,28 +23,27 @@ class UrlService:
     def __init__(
         self,
         session: Session,
-        code_length: int = 7,
         max_attempts: int = 5,
     ):
         self.repository = UrlRepository(session)
-        self.code_length = code_length
         self.max_attempts = max_attempts
 
-    def create(
-        self, target_url: str, expires_at: datetime | None
-    ) -> Url:
+    def create(self, target_url: str, expires_at: datetime | None) -> Url:
         for _ in range(self.max_attempts):
-            code = generate_short_code(self.code_length)
+            code = generate_short_code()
             try:
                 return self.repository.create(code, target_url, expires_at)
             except IntegrityError:
-                self.repository.session.rollback()
+                continue
         raise ShortCodeGenerationError(
             "Could not generate an available short code after bounded retries"
         )
 
-    def get_active_and_increment(self, short_code: str) -> Url | None:
-        return self.repository.find_active_and_increment(short_code)
+    def get_active_and_record_click(self, short_code: str) -> Url | None:
+        return self.repository.find_active_and_record_click(short_code)
+
+    def process_click_events(self, batch_size: int = 500) -> int:
+        return self.repository.process_click_events(batch_size)
 
     def get(self, short_code: str) -> Url | None:
         return self.repository.find(short_code)

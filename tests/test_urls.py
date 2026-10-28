@@ -4,10 +4,14 @@ from datetime import datetime, timedelta, timezone
 from fastapi.testclient import TestClient
 
 from app.main import create_app
+from app.services.urls import UrlService, generate_short_code
 
 
 def test_health_and_create_short_link(client: TestClient):
-    assert client.get("/health").json() == {"status": "ok"}
+    assert client.get("/health").json() == {
+        "status": "ok",
+        "database": "ok",
+    }
     response = client.post(
         "/api/shorten", json={"target_url": "https://example.com/path"}
     )
@@ -28,33 +32,32 @@ def test_duplicate_urls_receive_distinct_codes(client: TestClient):
 
 
 def test_code_collision_is_retried(client: TestClient, monkeypatch):
-    codes = iter(["AAAAAAA", "AAAAAAA", "BBBBBBB"])
-    monkeypatch.setattr("app.services.urls.generate_short_code", lambda _: next(codes))
+    existing = client.post(
+        "/api/shorten", json={"target_url": "https://example.com/existing"}
+    ).json()["short_code"]
+    available = generate_short_code()
+    while available == existing:
+        available = generate_short_code()
+    codes = iter([existing, available])
+    monkeypatch.setattr("app.services.urls.generate_short_code", lambda: next(codes))
 
-    first = client.post(
-        "/api/shorten", json={"target_url": "https://example.com/first"}
-    )
-    second = client.post(
-        "/api/shorten", json={"target_url": "https://example.com/second"}
+    response = client.post(
+        "/api/shorten", json={"target_url": "https://example.com/retried"}
     )
 
-    assert first.status_code == 201
-    assert second.status_code == 201
-    assert second.json()["short_code"] == "BBBBBBB"
+    assert response.status_code == 201
+    assert response.json()["short_code"] == available
 
 
 def test_code_collision_retries_are_bounded(client: TestClient, monkeypatch):
-    monkeypatch.setattr(
-        "app.services.urls.generate_short_code", lambda _: "AAAAAAA"
-    )
-    created = client.post(
-        "/api/shorten", json={"target_url": "https://example.com/first"}
-    )
+    existing = client.post(
+        "/api/shorten", json={"target_url": "https://example.com/existing"}
+    ).json()["short_code"]
+    monkeypatch.setattr("app.services.urls.generate_short_code", lambda: existing)
     exhausted = client.post(
         "/api/shorten", json={"target_url": "https://example.com/second"}
     )
 
-    assert created.status_code == 201
     assert exhausted.status_code == 503
 
 
@@ -64,11 +67,38 @@ def test_redirect_increments_click_count(client: TestClient):
     ).json()
 
     response = client.get(f"/{created['short_code']}", follow_redirects=False)
+    with client.app.state.session_factory() as session:
+        UrlService(session).process_click_events()
     stats = client.get(f"/api/urls/{created['short_code']}/stats").json()
 
     assert response.status_code == 302
     assert response.headers["location"] == "https://example.com/"
     assert stats["click_count"] == 1
+
+
+def test_click_analytics_is_batched_and_idempotent(tmp_path):
+    database_url = f"sqlite:///{(tmp_path / 'analytics.db').as_posix()}"
+    application = create_app(database_url=database_url)
+    with TestClient(application) as client:
+        created = client.post(
+            "/api/shorten", json={"target_url": "https://example.com"}
+        ).json()
+        for _ in range(3):
+            response = client.get(f"/{created['short_code']}", follow_redirects=False)
+            assert response.status_code == 302
+
+        assert (
+            client.get(f"/api/urls/{created['short_code']}/stats").json()["click_count"]
+            == 0
+        )
+        with application.state.session_factory() as session:
+            service = UrlService(session)
+            assert service.process_click_events(batch_size=2) == 2
+            assert service.process_click_events(batch_size=2) == 1
+            assert service.process_click_events(batch_size=2) == 0
+        stats = client.get(f"/api/urls/{created['short_code']}/stats").json()
+
+    assert stats["click_count"] == 3
 
 
 def test_expired_and_unknown_links_return_404(client: TestClient):
@@ -96,9 +126,7 @@ def test_expired_and_unknown_links_return_404(client: TestClient):
 
 
 def test_url_validation_rejects_non_http_schemes(client: TestClient):
-    response = client.post(
-        "/api/shorten", json={"target_url": "javascript:alert(1)"}
-    )
+    response = client.post("/api/shorten", json={"target_url": "javascript:alert(1)"})
 
     assert response.status_code == 422
 
@@ -125,6 +153,7 @@ def test_concurrent_creations_receive_distinct_codes(tmp_path):
     database_url = f"sqlite:///{(tmp_path / 'concurrent.db').as_posix()}"
     application = create_app(database_url=database_url)
     with TestClient(application) as client:
+
         def create_link(index: int) -> str:
             response = client.post(
                 "/api/shorten",
