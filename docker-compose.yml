@@ -21,6 +21,7 @@ services:
       DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/url_shortener
       BASE_URL: ${BASE_URL:-http://localhost:8000}
       SEO_INDEXABLE: ${SEO_INDEXABLE:-false}
+      ASYNC_CLICK_ANALYTICS: ${ASYNC_CLICK_ANALYTICS:-true}
       CREATE_RATE_LIMIT_COUNT: ${CREATE_RATE_LIMIT_COUNT:-60}
       CREATE_RATE_LIMIT_WINDOW_SECONDS: ${CREATE_RATE_LIMIT_WINDOW_SECONDS:-60}
       TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-false}

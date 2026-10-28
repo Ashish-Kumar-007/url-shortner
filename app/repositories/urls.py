@@ -1,7 +1,7 @@
 from collections.abc import Callable
 from datetime import datetime, timezone
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from app.models import ClickEvent, Url
@@ -25,6 +25,19 @@ class UrlRepository:
             self.session.flush()
         return url
 
+    def find_stats(self, short_code: str) -> tuple[Url, int] | None:
+        statement = (
+            select(Url, func.count(ClickEvent.id))
+            .outerjoin(ClickEvent, ClickEvent.short_code == Url.short_code)
+            .where(Url.short_code == short_code)
+            .group_by(Url.short_code)
+        )
+        result = self.session.execute(statement).one_or_none()
+        if result is None:
+            return None
+        url, pending_clicks = result
+        return url, int(pending_clicks)
+
     def find(self, short_code: str) -> Url | None:
         return self.session.get(Url, short_code)
 
@@ -32,6 +45,7 @@ class UrlRepository:
         self,
         short_code: str,
         validate_destination: Callable[[str], None] | None = None,
+        async_click_analytics: bool = True,
     ) -> Url | None:
         now = datetime.now(timezone.utc)
         statement = select(Url.short_code, Url.target_url, Url.expires_at).where(
@@ -44,7 +58,14 @@ class UrlRepository:
                 return None
             if validate_destination is not None:
                 validate_destination(result.target_url)
-            self.session.add(ClickEvent(short_code=short_code, clicked_at=now))
+            if async_click_analytics:
+                self.session.add(ClickEvent(short_code=short_code, clicked_at=now))
+            else:
+                self.session.execute(
+                    update(Url)
+                    .where(Url.short_code == short_code)
+                    .values(click_count=Url.click_count + 1)
+                )
             self.session.flush()
         return Url(
             short_code=result.short_code,

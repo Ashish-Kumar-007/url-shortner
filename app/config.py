@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     db_max_overflow: int = Field(default=10, ge=0, le=100)
     analytics_batch_size: int = Field(default=500, ge=1, le=10000)
     analytics_poll_interval_seconds: float = Field(default=0.25, gt=0, le=10)
+    async_click_analytics: bool = True
     create_rate_limit_count: int = Field(default=60, ge=1, le=10000)
     create_rate_limit_window_seconds: int = Field(default=60, ge=1, le=3600)
     trust_proxy_headers: bool = False

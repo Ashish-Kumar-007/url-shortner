@@ -295,6 +295,7 @@ def create_app(
             url = UrlService(session).get_active_and_record_click(
                 short_code,
                 validate_destination=validator,
+                async_click_analytics=configured_settings.async_click_analytics,
             )
         except ValueError as exc:
             raise HTTPException(
@@ -306,10 +307,17 @@ def create_app(
 
     @application.get("/api/urls/{short_code}/stats", response_model=UrlStatsResponse)
     def stats(short_code: str, session: DbSession):
-        url = UrlService(session).get(short_code)
-        if url is None:
+        result = UrlService(session).get_stats(short_code)
+        if result is None:
             raise HTTPException(status_code=404, detail="Short link not found")
-        return url
+        url, pending_clicks = result
+        return UrlStatsResponse(
+            short_code=url.short_code,
+            target_url=url.target_url,
+            created_at=url.created_at,
+            expires_at=url.expires_at,
+            click_count=url.click_count + pending_clicks,
+        )
 
     return application
 

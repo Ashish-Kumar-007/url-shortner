@@ -93,7 +93,14 @@ counter row. The separate PostgreSQL-backed worker claims event batches with
 `FOR UPDATE SKIP LOCKED`, aggregates counts per code, and commits the counter
 updates and event deletion together. This avoids lost increments across
 workers and retries a batch after a worker crash. Click statistics are
-eventually consistent; the Compose worker polls every 250 ms by default.
+eventually consistent when the worker is enabled; stats include both
+aggregated clicks and still-pending click events.
+
+Set `ASYNC_CLICK_ANALYTICS=false` when no worker can be deployed. Redirects
+then increment the click counter atomically in PostgreSQL, so stats work
+without a separate service. Keep it `true` when running the analytics worker
+to retain the measured lower-write redirect path. The default Compose worker
+polls every 250 ms.
 
 Repeat the benchmark above to compare the redirect tail latency before and
 after this change. Redis remains deferred: the test measured a write bottleneck,
@@ -133,6 +140,12 @@ localhost/private hostnames, and non-public literal IP addresses by default.
 Configuration is documented in `.env.example`. The GitHub Actions workflow now
 has read-only repository permissions. Sample Prometheus alert rules and an
 operations runbook are in `ops/`.
+
+For a Render deployment without a background worker, set
+`ASYNC_CLICK_ANALYTICS=false` in the web service's environment and redeploy.
+Historical queued click events remain included in stats; new redirects update
+the counter directly. If an analytics worker is available, retain the default
+`true` value in the web service and worker configuration.
 
 The in-process limiter is a supplementary control, not a distributed limiter:
 configure rate limits at the hosting edge as the authoritative abuse control.
@@ -189,6 +202,8 @@ origin. The `DB_CONNECT_TIMEOUT_SECONDS`, `DB_STATEMENT_TIMEOUT_MS`,
 `DB_POOL_TIMEOUT_SECONDS`, `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, and
 `CODE_GENERATION_ATTEMPTS` settings have safe bounds. Link creation is limited
 by `CREATE_RATE_LIMIT_COUNT` within `CREATE_RATE_LIMIT_WINDOW_SECONDS`.
+Set `ASYNC_CLICK_ANALYTICS=false` if the deployment does not run `app.worker`;
+otherwise keep it `true` and run the worker with the same database.
 `BLOCK_PRIVATE_DESTINATIONS` defaults to true; set it to false only for
 controlled development environments that intentionally redirect to private
 destinations. `TRUST_PROXY_HEADERS` defaults to false to prevent clients from

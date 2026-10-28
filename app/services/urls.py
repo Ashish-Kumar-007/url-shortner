@@ -44,10 +44,12 @@ class UrlService:
         self,
         short_code: str,
         validate_destination: Callable[[str], None] | None = None,
+        async_click_analytics: bool = True,
     ) -> Url | None:
         return self.repository.find_active_and_record_click(
             short_code,
             validate_destination=validate_destination,
+            async_click_analytics=async_click_analytics,
         )
 
     def process_click_events(self, batch_size: int = 500) -> int:
@@ -55,3 +57,6 @@ class UrlService:
 
     def get(self, short_code: str) -> Url | None:
         return self.repository.find(short_code)
+
+    def get_stats(self, short_code: str) -> tuple[Url, int] | None:
+        return self.repository.find_stats(short_code)

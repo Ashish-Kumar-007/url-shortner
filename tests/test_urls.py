@@ -89,13 +89,35 @@ def test_click_analytics_is_batched_and_idempotent(tmp_path):
 
         assert (
             client.get(f"/api/urls/{created['short_code']}/stats").json()["click_count"]
-            == 0
+            == 3
         )
         with application.state.session_factory() as session:
             service = UrlService(session)
             assert service.process_click_events(batch_size=2) == 2
             assert service.process_click_events(batch_size=2) == 1
             assert service.process_click_events(batch_size=2) == 0
+        stats = client.get(f"/api/urls/{created['short_code']}/stats").json()
+
+    assert stats["click_count"] == 3
+
+
+def test_synchronous_click_count_without_analytics_worker(tmp_path):
+    from app.config import Settings
+
+    database_url = f"sqlite:///{(tmp_path / 'sync-analytics.db').as_posix()}"
+    application = create_app(
+        app_settings=Settings(async_click_analytics=False),
+        database_url=database_url,
+    )
+    with TestClient(application) as client:
+        created = client.post(
+            "/api/shorten", json={"target_url": "https://example.com"}
+        ).json()
+
+        for _ in range(3):
+            response = client.get(f"/{created['short_code']}", follow_redirects=False)
+            assert response.status_code == 302
+
         stats = client.get(f"/api/urls/{created['short_code']}/stats").json()
 
     assert stats["click_count"] == 3
